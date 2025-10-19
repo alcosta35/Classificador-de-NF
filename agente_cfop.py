@@ -18,11 +18,11 @@ class AgenteValidadorCFOP:
         self.df_itens = pd.read_csv(itens_path)
         self.df_cfop = pd.read_csv(cfop_path)
         
-        # Configurar LLM
+        # Configurar LLM - CORRIGIDO
         self.llm = ChatOpenAI(
             model="gpt-4",
             temperature=0,
-            api_key=os.getenv("OPENAI_API_KEY")
+            openai_api_key=os.getenv("OPENAI_API_KEY")  # Mudou de api_key para openai_api_key
         )
         
         # Criar ferramentas
@@ -38,7 +38,8 @@ class AgenteValidadorCFOP:
             tools=self.tools,
             verbose=True,
             max_iterations=10,
-            return_intermediate_steps=True
+            return_intermediate_steps=True,
+            handle_parsing_errors=True  # Adiciona tratamento de erros
         )
     
     def _criar_prompt(self):
@@ -307,4 +308,4 @@ Sempre forneça:
             resultado = self.agent_executor.invoke({"input": pergunta})
             return resultado["output"]
         except Exception as e:
-            return f"Erro ao processar pergunta: {str(e)}"
+            return f"Erro ao processar pergunta: {str(e)}\n\nPor favor, reformule sua pergunta ou verifique se os dados foram carregados corretamente."
