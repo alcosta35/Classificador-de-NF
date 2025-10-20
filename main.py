@@ -1,757 +1,819 @@
-from fastapi import FastAPI, File, UploadFile, Form, HTTPException
+from fastapi import FastAPI, UploadFile, File, HTTPException
 from fastapi.responses import HTMLResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
+from pydantic import BaseModel
+from datetime import datetime
 import os
+import zipfile
 import shutil
-from pathlib import Path
+import traceback
 from agente_cfop import AgenteValidadorCFOP
-from utils import extrair_zip, limpar_diretorio_temp
 
-app = FastAPI(
-    title="Sistema de Validação de CFOP - Notas Fiscais",
-    description="API para análise e validação de CFOP em Notas Fiscais utilizando IA",
-    version="1.0.0"
-)
+# ============================================================================
+# CONFIGURAÇÃO DA APLICAÇÃO
+# ============================================================================
 
-# Diretórios
-UPLOAD_DIR = Path("uploads")
-TEMP_DIR = Path("temp_csvs")
-UPLOAD_DIR.mkdir(exist_ok=True)
-TEMP_DIR.mkdir(exist_ok=True)
+app = FastAPI(title="Sistema de Validação CFOP")
 
-# Inicializar agente
-agente = None
+# Variável global para o agente
+agente_validador = None
 
-@app.get("/", response_class=HTMLResponse)
-async def home():
-    """Página inicial com menu de navegação"""
-    html_content = """
+# ============================================================================
+# MODELO DE DADOS
+# ============================================================================
+
+class PerguntaRequest(BaseModel):
+    pergunta: str
+
+# ============================================================================
+# FUNÇÃO PARA INICIALIZAR AGENTE
+# ============================================================================
+
+def inicializar_agente_se_possivel():
+    """Verifica se os CSVs existem e inicializa o agente"""
+    global agente_validador
+    
+    print("\n" + "="*70)
+    print("🔍 VERIFICANDO SE PODE INICIALIZAR AGENTE")
+    print("="*70)
+    
+    temp_dir = "temp_csvs"
+    
+    if not os.path.exists(temp_dir):
+        print("❌ Diretório temp_csvs não existe")
+        print("="*70 + "\n")
+        return False
+    
+    # Procurar os 3 CSVs necessários
+    csvs_encontrados = {
+        'cabecalho': None,
+        'itens': None,
+        'cfop': None
+    }
+    
+    arquivos_no_dir = os.listdir(temp_dir)
+    print(f"📂 Arquivos no diretório: {arquivos_no_dir}")
+    
+    for filename in arquivos_no_dir:
+        filepath = os.path.join(temp_dir, filename)
+        filename_lower = filename.lower()
+        
+        if 'cabecalho' in filename_lower or 'cabeçalho' in filename_lower:
+            csvs_encontrados['cabecalho'] = filepath
+            print(f"   ✅ Cabeçalho: {filename}")
+        elif 'itens' in filename_lower or 'item' in filename_lower:
+            csvs_encontrados['itens'] = filepath
+            print(f"   ✅ Itens: {filename}")
+        elif 'cfop' in filename_lower:
+            csvs_encontrados['cfop'] = filepath
+            print(f"   ✅ CFOP: {filename}")
+    
+    # Verificar se encontrou todos
+    missing = [k for k, v in csvs_encontrados.items() if v is None]
+    
+    if missing:
+        print(f"❌ CSVs faltando: {', '.join(missing)}")
+        print("="*70 + "\n")
+        return False
+    
+    print("\n✅ Todos os CSVs encontrados:")
+    for tipo, path in csvs_encontrados.items():
+        tamanho = os.path.getsize(path)
+        print(f"   - {tipo}: {os.path.basename(path)} ({tamanho:,} bytes)")
+    
+    # Tentar criar o agente
+    try:
+        print("\n🤖 Criando AgenteValidadorCFOP...")
+        agente_validador = AgenteValidadorCFOP(
+            cabecalho_path=csvs_encontrados['cabecalho'],
+            itens_path=csvs_encontrados['itens'],
+            cfop_path=csvs_encontrados['cfop']
+        )
+        print("✅ AGENTE INICIALIZADO COM SUCESSO!")
+        print("="*70 + "\n")
+        return True
+        
+    except Exception as e:
+        print(f"❌ Erro ao criar agente: {e}")
+        traceback.print_exc()
+        print("="*70 + "\n")
+        agente_validador = None
+        return False
+
+# ============================================================================
+# EVENTO DE STARTUP
+# ============================================================================
+
+@app.on_event("startup")
+async def startup_event():
+    """Executado quando a aplicação inicia"""
+    print("\n" + "="*70)
+    print("🚀 INICIANDO APLICAÇÃO FASTAPI")
+    print("="*70)
+    print(f"⏰ Timestamp: {datetime.now()}")
+    print("="*70 + "\n")
+    
+    # Criar diretórios se não existirem
+    os.makedirs("uploads", exist_ok=True)
+    os.makedirs("temp_csvs", exist_ok=True)
+    print("✅ Diretórios criados/verificados")
+    
+    # Tentar inicializar agente automaticamente
+    print("\n🔄 Tentando inicializar agente automaticamente...")
+    inicializar_agente_se_possivel()
+
+# ============================================================================
+# COMPONENTE DE NAVEGAÇÃO (para reusar em todas as páginas)
+# ============================================================================
+
+NAV_BUTTONS = """
+<div style="text-align: center; margin: 20px 0; padding: 15px; background: #f0f0f0; border-radius: 5px;">
+    <a href="/" style="margin: 0 10px; color: #667eea; text-decoration: none; font-weight: bold;">🏠 Início</a>
+    <a href="/upload" style="margin: 0 10px; color: #667eea; text-decoration: none; font-weight: bold;">📤 Upload</a>
+    <a href="/analise" style="margin: 0 10px; color: #667eea; text-decoration: none; font-weight: bold;">🔍 Análise</a>
+    <a href="/status" style="margin: 0 10px; color: #667eea; text-decoration: none; font-weight: bold;">📊 Status</a>
+</div>
+"""
+
+# ============================================================================
+# ENDPOINTS DE STATUS E DEBUG
+# ============================================================================
+
+@app.get("/")
+def home():
+    """Página inicial"""
+    return HTMLResponse("""
     <!DOCTYPE html>
-    <html lang="pt-BR">
+    <html>
     <head>
-        <meta charset="UTF-8">
-        <meta name="viewport" content="width=device-width, initial-scale=1.0">
-        <title>Sistema de Validação CFOP - Notas Fiscais</title>
+        <title>Sistema de Validação CFOP</title>
         <style>
-            * {
-                margin: 0;
-                padding: 0;
-                box-sizing: border-box;
-            }
             body {
-                font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
-                background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
-                min-height: 100vh;
-                display: flex;
-                justify-content: center;
-                align-items: center;
-                padding: 20px;
-            }
-            .container {
-                background: white;
-                border-radius: 20px;
-                padding: 50px;
-                box-shadow: 0 20px 60px rgba(0,0,0,0.3);
+                font-family: Arial, sans-serif;
                 max-width: 800px;
-                width: 100%;
-            }
-            h1 {
-                color: #667eea;
-                text-align: center;
-                margin-bottom: 15px;
-                font-size: 2.5em;
-            }
-            .subtitle {
-                text-align: center;
-                color: #666;
-                margin-bottom: 40px;
-                font-size: 1.1em;
-            }
-            .button-container {
-                display: grid;
-                grid-template-columns: 1fr 1fr;
-                gap: 30px;
-                margin-top: 30px;
-            }
-            .nav-button {
+                margin: 50px auto;
+                padding: 20px;
                 background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
                 color: white;
-                border: none;
-                padding: 40px 30px;
-                border-radius: 15px;
-                font-size: 1.2em;
-                font-weight: bold;
-                cursor: pointer;
-                transition: all 0.3s ease;
-                text-decoration: none;
-                display: flex;
-                flex-direction: column;
-                align-items: center;
-                gap: 15px;
-                box-shadow: 0 4px 15px rgba(102, 126, 234, 0.4);
             }
-            .nav-button:hover {
-                transform: translateY(-5px);
-                box-shadow: 0 8px 25px rgba(102, 126, 234, 0.6);
-            }
-            .icon {
-                font-size: 3em;
-            }
-            .info-box {
-                background: #f8f9fa;
-                padding: 20px;
+            .container {
+                background: rgba(255, 255, 255, 0.1);
+                padding: 30px;
                 border-radius: 10px;
-                margin-top: 30px;
-                border-left: 4px solid #667eea;
+                backdrop-filter: blur(10px);
             }
-            .info-box h3 {
+            h1 { text-align: center; margin-bottom: 30px; }
+            .btn {
+                display: block;
+                width: 100%;
+                padding: 15px;
+                margin: 10px 0;
+                background: white;
                 color: #667eea;
-                margin-bottom: 10px;
+                text-decoration: none;
+                text-align: center;
+                border-radius: 5px;
+                font-weight: bold;
+                transition: transform 0.2s;
             }
-            .info-box ul {
-                margin-left: 20px;
-                color: #666;
-            }
-            .info-box li {
-                margin: 8px 0;
-            }
+            .btn:hover { transform: scale(1.05); }
         </style>
     </head>
     <body>
         <div class="container">
-            <h1>🧾 Sistema de Validação CFOP</h1>
-            <p class="subtitle">Análise Inteligente de Notas Fiscais</p>
-            
-            <div class="button-container">
-                <a href="/upload" class="nav-button">
-                    <span class="icon">📤</span>
-                    <span>Upload de Arquivos</span>
-                    <span style="font-size: 0.8em; font-weight: normal;">Enviar CSV de Notas Fiscais</span>
-                </a>
-                
-                <a href="/analise" class="nav-button">
-                    <span class="icon">🤖</span>
-                    <span>Análise Inteligente</span>
-                    <span style="font-size: 0.8em; font-weight: normal;">Validar CFOP com IA</span>
-                </a>
-            </div>
-            
-            <div class="info-box">
-                <h3>📋 Arquivos Necessários:</h3>
-                <ul>
-                    <li><strong>202401_NFs_Cabecalho.csv</strong> - Dados de cabeçalho das NFs</li>
-                    <li><strong>202401_NFs_Itens.csv</strong> - Itens detalhados das NFs</li>
-                    <li><strong>CFOP.csv</strong> - Tabela de códigos CFOP</li>
-                </ul>
-                <p style="margin-top: 15px; color: #666;">
-                    💡 <strong>Dica:</strong> Faça upload dos 3 arquivos em formato ZIP na primeira página.
-                </p>
-            </div>
+            <h1>🤖 Sistema de Validação CFOP</h1>
+            <a href="/upload" class="btn">📤 Upload de Arquivos CSV</a>
+            <a href="/analise" class="btn">🔍 Análise Inteligente</a>
+            <a href="/status" class="btn">📊 Status do Sistema</a>
+            <a href="/docs" class="btn">📚 Documentação API</a>
         </div>
     </body>
     </html>
-    """
-    return HTMLResponse(content=html_content)
+    """)
 
-@app.get("/upload", response_class=HTMLResponse)
-async def upload_page():
-    """Página de upload de arquivos"""
-    html_content = """
+@app.get("/status")
+def status():
+    """Status do sistema"""
+    temp_dir = "temp_csvs"
+    csvs_disponiveis = []
+    
+    if os.path.exists(temp_dir):
+        csvs_disponiveis = os.listdir(temp_dir)
+    
+    return {
+        "status": "online",
+        "timestamp": datetime.now().isoformat(),
+        "agente_inicializado": agente_validador is not None,
+        "csvs_disponiveis": csvs_disponiveis,
+        "diretorios": {
+            "uploads": os.path.exists("uploads"),
+            "temp_csvs": os.path.exists("temp_csvs")
+        }
+    }
+
+@app.get("/debug")
+def debug():
+    """Informações detalhadas para debug"""
+    return {
+        "agente": {
+            "inicializado": agente_validador is not None,
+            "tipo": str(type(agente_validador)) if agente_validador else None
+        },
+        "arquivos": {
+            "uploads": os.listdir("uploads") if os.path.exists("uploads") else [],
+            "temp_csvs": os.listdir("temp_csvs") if os.path.exists("temp_csvs") else []
+        },
+        "ambiente": {
+            "openai_key_configurada": bool(os.getenv("OPENAI_API_KEY")),
+            "cwd": os.getcwd()
+        }
+    }
+
+# ============================================================================
+# ENDPOINT PARA FORÇAR REINICIALIZAÇÃO
+# ============================================================================
+
+@app.post("/inicializar_agente/")
+def inicializar_agente():
+    """Força a reinicialização do agente"""
+    print("\n📍 Requisição para inicializar/reinicializar agente")
+    
+    sucesso = inicializar_agente_se_possivel()
+    
+    if sucesso:
+        return {
+            "status": "success",
+            "message": "Agente inicializado com sucesso!",
+            "agente_pronto": True
+        }
+    else:
+        return {
+            "status": "error",
+            "message": "Não foi possível inicializar o agente. Verifique se os 3 CSVs foram carregados.",
+            "agente_pronto": False
+        }
+
+# ============================================================================
+# PÁGINA DE UPLOAD
+# ============================================================================
+
+@app.get("/upload")
+def upload_page():
+    """Página de upload"""
+    return HTMLResponse(f"""
     <!DOCTYPE html>
-    <html lang="pt-BR">
+    <html>
     <head>
-        <meta charset="UTF-8">
-        <meta name="viewport" content="width=device-width, initial-scale=1.0">
-        <title>Upload de Arquivos - CFOP</title>
+        <title>Upload de Arquivos CSV</title>
         <style>
-            * {
-                margin: 0;
-                padding: 0;
-                box-sizing: border-box;
-            }
-            body {
-                font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
-                background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
-                min-height: 100vh;
-                padding: 20px;
-            }
-            .container {
+            body {{
+                font-family: Arial, sans-serif;
                 max-width: 800px;
                 margin: 50px auto;
+                padding: 20px;
+                background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            }}
+            .container {{
                 background: white;
-                border-radius: 20px;
                 padding: 40px;
-                box-shadow: 0 20px 60px rgba(0,0,0,0.3);
-            }
-            h1 {
-                color: #667eea;
-                margin-bottom: 30px;
-                text-align: center;
-            }
-            .upload-area {
-                border: 3px dashed #667eea;
-                border-radius: 15px;
-                padding: 60px 40px;
-                text-align: center;
-                cursor: pointer;
-                transition: all 0.3s ease;
-                background: #f8f9fa;
-            }
-            .upload-area:hover {
-                background: #e9ecef;
-                border-color: #764ba2;
-            }
-            .upload-area.dragover {
-                background: #dee2e6;
-                border-color: #764ba2;
-            }
-            .upload-icon {
-                font-size: 4em;
-                margin-bottom: 20px;
-            }
-            input[type="file"] {
-                display: none;
-            }
-            .file-info {
-                margin-top: 20px;
-                padding: 15px;
-                background: #e7f3ff;
                 border-radius: 10px;
-                display: none;
-            }
-            .file-info.show {
-                display: block;
-            }
-            .submit-btn {
-                width: 100%;
-                padding: 15px;
+                box-shadow: 0 4px 6px rgba(0,0,0,0.1);
+            }}
+            h1 {{ color: #667eea; text-align: center; }}
+            .upload-area {{
+                border: 3px dashed #667eea;
+                border-radius: 10px;
+                padding: 40px;
+                text-align: center;
+                margin: 20px 0;
+                cursor: pointer;
+                transition: all 0.3s;
+            }}
+            .upload-area:hover {{
+                background: #f0f0f0;
+                border-color: #764ba2;
+            }}
+            .btn {{
                 background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
                 color: white;
                 border: none;
-                border-radius: 10px;
-                font-size: 1.2em;
-                font-weight: bold;
+                padding: 15px 30px;
+                border-radius: 5px;
                 cursor: pointer;
+                font-size: 16px;
+                width: 100%;
                 margin-top: 20px;
-                transition: all 0.3s ease;
-            }
-            .submit-btn:hover {
-                transform: translateY(-2px);
-                box-shadow: 0 8px 25px rgba(102, 126, 234, 0.6);
-            }
-            .submit-btn:disabled {
-                background: #ccc;
-                cursor: not-allowed;
-                transform: none;
-            }
-            .back-btn {
-                display: inline-block;
-                padding: 10px 20px;
-                background: #6c757d;
-                color: white;
-                text-decoration: none;
-                border-radius: 8px;
-                margin-bottom: 20px;
-                transition: all 0.3s ease;
-            }
-            .back-btn:hover {
-                background: #5a6268;
-            }
-            .response-area {
-                margin-top: 30px;
-                padding: 20px;
-                background: #f8f9fa;
-                border-radius: 10px;
-                display: none;
-            }
-            .response-area.show {
-                display: block;
-            }
-            .success {
-                color: #28a745;
-            }
-            .error {
-                color: #dc3545;
-            }
-            .loading {
-                display: none;
-                text-align: center;
+            }}
+            .btn:hover {{ opacity: 0.9; }}
+            #resultado {{
                 margin-top: 20px;
-            }
-            .loading.show {
-                display: block;
-            }
-            .spinner {
-                border: 4px solid #f3f3f3;
-                border-top: 4px solid #667eea;
-                border-radius: 50%;
-                width: 50px;
-                height: 50px;
-                animation: spin 1s linear infinite;
-                margin: 0 auto;
-            }
-            @keyframes spin {
-                0% { transform: rotate(0deg); }
-                100% { transform: rotate(360deg); }
-            }
+                padding: 15px;
+                border-radius: 5px;
+                display: none;
+            }}
+            .success {{
+                background: #d4edda;
+                color: #155724;
+                border: 1px solid #c3e6cb;
+            }}
+            .error {{
+                background: #f8d7da;
+                color: #721c24;
+                border: 1px solid #f5c6cb;
+            }}
+            .file-selected {{
+                background: #e7f3ff;
+                padding: 10px;
+                border-radius: 5px;
+                margin: 10px 0;
+            }}
         </style>
     </head>
     <body>
         <div class="container">
-            <a href="/" class="back-btn">⬅️ Voltar</a>
-            <h1>📤 Upload de Arquivos CSV</h1>
+            {NAV_BUTTONS}
             
-            <form id="uploadForm" enctype="multipart/form-data">
-                <div class="upload-area" id="uploadArea">
-                    <div class="upload-icon">📦</div>
-                    <h3>Arraste e solte o arquivo ZIP aqui</h3>
-                    <p style="margin-top: 10px; color: #666;">ou clique para selecionar</p>
-                    <input type="file" id="fileInput" name="zip_file" accept=".zip" required>
-                </div>
-                
-                <div class="file-info" id="fileInfo">
-                    <strong>Arquivo selecionado:</strong> <span id="fileName"></span>
-                </div>
-                
-                <button type="submit" class="submit-btn" id="submitBtn" disabled>
-                    Enviar Arquivos
-                </button>
-            </form>
+            <h1>📦 Upload de Arquivos CSV</h1>
             
-            <div class="loading" id="loading">
-                <div class="spinner"></div>
-                <p style="margin-top: 15px; color: #667eea;">Processando arquivos...</p>
+            <p style="text-align: center; color: #666;">
+                Arraste e solte o arquivo ZIP aqui<br>
+                ou clique para selecionar
+            </p>
+            
+            <div class="upload-area" id="uploadArea" onclick="document.getElementById('fileInput').click()">
+                <div style="font-size: 48px;">📁</div>
+                <p>Arraste e solte o arquivo ZIP aqui<br>ou clique para selecionar</p>
+                <p style="font-size: 12px; color: #999;">
+                    Arquivo selecionado: <span id="fileName">Nenhum</span>
+                </p>
             </div>
             
-            <div class="response-area" id="responseArea"></div>
+            <input type="file" id="fileInput" accept=".zip" style="display: none;" onchange="handleFileSelect(event)">
+            
+            <div id="fileSelected" class="file-selected" style="display: none;">
+                ✅ Arquivo selecionado: <strong id="selectedFileName"></strong>
+            </div>
+            
+            <button class="btn" onclick="enviarArquivo()">Enviar Arquivos</button>
+            
+            <div id="resultado"></div>
         </div>
-        
+
         <script>
+            let arquivoSelecionado = null;
+
             const uploadArea = document.getElementById('uploadArea');
-            const fileInput = document.getElementById('fileInput');
-            const fileInfo = document.getElementById('fileInfo');
-            const fileName = document.getElementById('fileName');
-            const submitBtn = document.getElementById('submitBtn');
-            const uploadForm = document.getElementById('uploadForm');
-            const loading = document.getElementById('loading');
-            const responseArea = document.getElementById('responseArea');
             
-            uploadArea.addEventListener('click', () => fileInput.click());
-            
-            uploadArea.addEventListener('dragover', (e) => {
+            uploadArea.addEventListener('dragover', (e) => {{
                 e.preventDefault();
-                uploadArea.classList.add('dragover');
-            });
+                uploadArea.style.background = '#f0f0f0';
+            }});
             
-            uploadArea.addEventListener('dragleave', () => {
-                uploadArea.classList.remove('dragover');
-            });
+            uploadArea.addEventListener('dragleave', () => {{
+                uploadArea.style.background = 'white';
+            }});
             
-            uploadArea.addEventListener('drop', (e) => {
+            uploadArea.addEventListener('drop', (e) => {{
                 e.preventDefault();
-                uploadArea.classList.remove('dragover');
-                fileInput.files = e.dataTransfer.files;
-                updateFileInfo();
-            });
-            
-            fileInput.addEventListener('change', updateFileInfo);
-            
-            function updateFileInfo() {
-                if (fileInput.files.length > 0) {
-                    fileName.textContent = fileInput.files[0].name;
-                    fileInfo.classList.add('show');
-                    submitBtn.disabled = false;
-                }
-            }
-            
-            uploadForm.addEventListener('submit', async (e) => {
-                e.preventDefault();
-                
+                uploadArea.style.background = 'white';
+                const files = e.dataTransfer.files;
+                if (files.length > 0) {{
+                    arquivoSelecionado = files[0];
+                    document.getElementById('fileName').textContent = files[0].name;
+                    document.getElementById('selectedFileName').textContent = files[0].name;
+                    document.getElementById('fileSelected').style.display = 'block';
+                }}
+            }});
+
+            function handleFileSelect(event) {{
+                arquivoSelecionado = event.target.files[0];
+                if (arquivoSelecionado) {{
+                    document.getElementById('fileName').textContent = arquivoSelecionado.name;
+                    document.getElementById('selectedFileName').textContent = arquivoSelecionado.name;
+                    document.getElementById('fileSelected').style.display = 'block';
+                }}
+            }}
+
+            async function enviarArquivo() {{
+                if (!arquivoSelecionado) {{
+                    alert('Por favor, selecione um arquivo ZIP primeiro!');
+                    return;
+                }}
+
+                const resultado = document.getElementById('resultado');
+                resultado.innerHTML = '⏳ Enviando arquivo...';
+                resultado.className = '';
+                resultado.style.display = 'block';
+
                 const formData = new FormData();
-                formData.append('zip_file', fileInput.files[0]);
-                
-                loading.classList.add('show');
-                submitBtn.disabled = true;
-                responseArea.classList.remove('show');
-                
-                try {
-                    const response = await fetch('/processar_upload/', {
+                formData.append('file', arquivoSelecionado);
+
+                try {{
+                    const response = await fetch('/processar_upload/', {{
                         method: 'POST',
                         body: formData
-                    });
-                    
-                    const result = await response.json();
-                    
-                    if (response.ok) {
-                        responseArea.innerHTML = `
-                            <h3 class="success">✅ Upload realizado com sucesso!</h3>
-                            <p style="margin-top: 15px;"><strong>Mensagem:</strong> ${result.mensagem}</p>
-                            <p style="margin-top: 10px;"><strong>Arquivos processados:</strong></p>
-                            <ul style="margin-left: 20px; margin-top: 5px;">
-                                ${result.arquivos.map(f => `<li>${f}</li>`).join('')}
-                            </ul>
-                            <p style="margin-top: 15px; padding: 15px; background: #d1ecf1; border-radius: 8px; color: #0c5460;">
-                                💡 Agora você pode ir para a página de <a href="/analise" style="color: #004085; font-weight: bold;">Análise Inteligente</a> para validar os CFOP!
-                            </p>
+                    }});
+
+                    const data = await response.json();
+
+                    if (response.ok) {{
+                        resultado.innerHTML = `
+                            ✅ ${{data.message}}<br>
+                            <strong>Agente inicializado:</strong> ${{data.agente_inicializado ? 'Sim' : 'Não'}}<br>
+                            <strong>Arquivos extraídos:</strong> ${{data.arquivos_extraidos.join(', ')}}<br><br>
+                            ${{data.agente_inicializado ? 
+                                '<a href="/analise" style="color: #667eea; font-weight: bold;">→ Ir para Análise Inteligente</a>' : 
+                                '⚠️ Agente não foi inicializado. Verifique se os 3 CSVs estão no ZIP.'}}
                         `;
-                        responseArea.classList.add('show');
-                    } else {
-                        throw new Error(result.detail || 'Erro no upload');
-                    }
-                } catch (error) {
-                    responseArea.innerHTML = `
-                        <h3 class="error">❌ Erro no upload</h3>
-                        <p style="margin-top: 15px;">${error.message}</p>
-                    `;
-                    responseArea.classList.add('show');
-                    submitBtn.disabled = false;
-                } finally {
-                    loading.classList.remove('show');
-                }
-            });
+                        resultado.className = 'success';
+                    }} else {{
+                        resultado.innerHTML = `❌ Erro: ${{data.detail}}`;
+                        resultado.className = 'error';
+                    }}
+                }} catch (error) {{
+                    resultado.innerHTML = `❌ Erro ao enviar arquivo: ${{error.message}}`;
+                    resultado.className = 'error';
+                }}
+            }}
         </script>
     </body>
     </html>
-    """
-    return HTMLResponse(content=html_content)
+    """)
 
-@app.get("/analise", response_class=HTMLResponse)
-async def analise_page():
-    """Página de análise com agente IA"""
-    html_content = """
+# ============================================================================
+# ENDPOINT DE UPLOAD
+# ============================================================================
+
+@app.post("/processar_upload/")
+async def processar_upload(file: UploadFile = File(...)):
+    """Processa o upload do arquivo ZIP com os CSVs"""
+    print(f"\n{'='*70}")
+    print(f"📦 RECEBENDO UPLOAD: {file.filename}")
+    print(f"{'='*70}\n")
+    
+    try:
+        # Validar tipo de arquivo
+        if not file.filename.endswith('.zip'):
+            raise HTTPException(status_code=400, detail="Apenas arquivos ZIP são aceitos")
+        
+        # Salvar ZIP
+        zip_path = os.path.join("uploads", file.filename)
+        print(f"💾 Salvando ZIP em: {zip_path}")
+        
+        with open(zip_path, "wb") as f:
+            conteudo = await file.read()
+            f.write(conteudo)
+        
+        print(f"✅ ZIP salvo: {len(conteudo):,} bytes")
+        
+        # Preparar diretório de destino
+        temp_dir = "temp_csvs"
+        
+        # Limpar diretório anterior
+        if os.path.exists(temp_dir):
+            print(f"🧹 Limpando diretório anterior: {temp_dir}")
+            shutil.rmtree(temp_dir)
+        
+        os.makedirs(temp_dir)
+        print(f"📁 Diretório criado: {temp_dir}")
+        
+        # Extrair ZIP
+        print(f"📦 Extraindo arquivos...")
+        with zipfile.ZipFile(zip_path, 'r') as zip_ref:
+            zip_ref.extractall(temp_dir)
+        
+        arquivos_extraidos = os.listdir(temp_dir)
+        print(f"✅ {len(arquivos_extraidos)} arquivos extraídos:")
+        for arquivo in arquivos_extraidos:
+            tamanho = os.path.getsize(os.path.join(temp_dir, arquivo))
+            print(f"   - {arquivo} ({tamanho:,} bytes)")
+        
+        # Tentar inicializar agente
+        print("\n🤖 Tentando inicializar agente...")
+        agente_ok = inicializar_agente_se_possivel()
+        
+        return {
+            "status": "success",
+            "message": "Upload concluído e arquivos extraídos!",
+            "agente_inicializado": agente_ok,
+            "arquivos_extraidos": arquivos_extraidos
+        }
+        
+    except zipfile.BadZipFile:
+        print(f"❌ Arquivo ZIP inválido")
+        raise HTTPException(status_code=400, detail="Arquivo ZIP inválido ou corrompido")
+    except Exception as e:
+        print(f"\n❌ ERRO no upload: {e}")
+        traceback.print_exc()
+        raise HTTPException(status_code=500, detail=str(e))
+
+# ============================================================================
+# PÁGINA DE ANÁLISE
+# ============================================================================
+
+@app.get("/analise")
+def analise_page():
+    """Página de análise inteligente"""
+    return HTMLResponse(f"""
     <!DOCTYPE html>
-    <html lang="pt-BR">
+    <html>
     <head>
-        <meta charset="UTF-8">
-        <meta name="viewport" content="width=device-width, initial-scale=1.0">
         <title>Análise Inteligente CFOP</title>
         <style>
-            * {
+            body {{
+                font-family: Arial, sans-serif;
                 margin: 0;
-                padding: 0;
-                box-sizing: border-box;
-            }
-            body {
-                font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+                padding: 20px;
                 background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
                 min-height: 100vh;
-                padding: 20px;
-            }
-            .container {
+            }}
+            .container {{
                 max-width: 1000px;
-                margin: 50px auto;
+                margin: 0 auto;
                 background: white;
-                border-radius: 20px;
-                padding: 40px;
-                box-shadow: 0 20px 60px rgba(0,0,0,0.3);
-            }
-            h1 {
-                color: #667eea;
-                margin-bottom: 30px;
-                text-align: center;
-            }
-            .back-btn {
-                display: inline-block;
-                padding: 10px 20px;
-                background: #6c757d;
-                color: white;
-                text-decoration: none;
-                border-radius: 8px;
-                margin-bottom: 20px;
-                transition: all 0.3s ease;
-            }
-            .back-btn:hover {
-                background: #5a6268;
-            }
-            .chat-container {
-                background: #f8f9fa;
-                border-radius: 15px;
+                border-radius: 10px;
+                padding: 30px;
+                box-shadow: 0 4px 6px rgba(0,0,0,0.1);
+            }}
+            h1 {{ color: #667eea; text-align: center; }}
+            .chat-container {{
+                height: 500px;
+                border: 2px solid #667eea;
+                border-radius: 10px;
                 padding: 20px;
-                min-height: 400px;
-                max-height: 500px;
                 overflow-y: auto;
-                margin-bottom: 20px;
-            }
-            .message {
-                margin-bottom: 15px;
+                margin: 20px 0;
+                background: #f9f9f9;
+            }}
+            .message {{
+                margin: 10px 0;
                 padding: 15px;
                 border-radius: 10px;
                 max-width: 80%;
-            }
-            .user-message {
-                background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+                white-space: pre-wrap;
+                word-wrap: break-word;
+            }}
+            .user-message {{
+                background: #667eea;
                 color: white;
                 margin-left: auto;
                 text-align: right;
-            }
-            .ai-message {
+            }}
+            .agent-message {{
                 background: white;
-                color: #333;
-                border: 1px solid #dee2e6;
-            }
-            .input-area {
+                border: 1px solid #ddd;
+            }}
+            .input-area {{
                 display: flex;
                 gap: 10px;
-            }
-            #promptInput {
+            }}
+            input[type="text"] {{
                 flex: 1;
                 padding: 15px;
                 border: 2px solid #667eea;
-                border-radius: 10px;
-                font-size: 1em;
-                font-family: inherit;
-            }
-            .send-btn {
-                padding: 15px 30px;
+                border-radius: 5px;
+                font-size: 16px;
+            }}
+            button {{
                 background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
                 color: white;
                 border: none;
-                border-radius: 10px;
-                font-size: 1em;
-                font-weight: bold;
+                padding: 15px 30px;
+                border-radius: 5px;
                 cursor: pointer;
-                transition: all 0.3s ease;
-            }
-            .send-btn:hover {
-                transform: translateY(-2px);
-                box-shadow: 0 8px 25px rgba(102, 126, 234, 0.6);
-            }
-            .send-btn:disabled {
-                background: #ccc;
+                font-size: 16px;
+            }}
+            button:hover {{ opacity: 0.9; }}
+            button:disabled {{
+                opacity: 0.5;
                 cursor: not-allowed;
-                transform: none;
-            }
-            .examples {
-                background: #e7f3ff;
-                padding: 20px;
-                border-radius: 10px;
-                margin-top: 20px;
-            }
-            .examples h3 {
-                color: #667eea;
-                margin-bottom: 15px;
-            }
-            .example-item {
-                padding: 10px;
-                margin: 8px 0;
-                background: white;
-                border-radius: 8px;
-                cursor: pointer;
-                transition: all 0.2s ease;
-                border-left: 3px solid #667eea;
-            }
-            .example-item:hover {
-                background: #f8f9fa;
-                transform: translateX(5px);
-            }
-            .loading {
-                display: none;
+            }}
+            .loading {{
                 text-align: center;
-                padding: 20px;
-            }
-            .loading.show {
-                display: block;
-            }
-            .spinner {
-                border: 4px solid #f3f3f3;
-                border-top: 4px solid #667eea;
-                border-radius: 50%;
-                width: 40px;
-                height: 40px;
-                animation: spin 1s linear infinite;
-                margin: 0 auto;
-            }
-            @keyframes spin {
-                0% { transform: rotate(0deg); }
-                100% { transform: rotate(360deg); }
-            }
+                color: #999;
+                font-style: italic;
+            }}
+            .status-badge {{
+                display: inline-block;
+                padding: 5px 15px;
+                border-radius: 20px;
+                font-size: 12px;
+                margin-bottom: 20px;
+            }}
+            .status-online {{
+                background: #d4edda;
+                color: #155724;
+            }}
+            .status-offline {{
+                background: #f8d7da;
+                color: #721c24;
+            }}
+            .examples {{
+                background: #e7f3ff;
+                padding: 15px;
+                border-radius: 5px;
+                margin: 20px 0;
+            }}
+            .examples h3 {{
+                margin-top: 0;
+                color: #667eea;
+            }}
+            .example-btn {{
+                display: inline-block;
+                margin: 5px;
+                padding: 8px 15px;
+                background: white;
+                border: 1px solid #667eea;
+                border-radius: 5px;
+                cursor: pointer;
+                font-size: 14px;
+                color: #667eea;
+            }}
+            .example-btn:hover {{
+                background: #667eea;
+                color: white;
+            }}
         </style>
     </head>
     <body>
         <div class="container">
-            <a href="/" class="back-btn">⬅️ Voltar</a>
+            {NAV_BUTTONS}
+            
             <h1>🤖 Análise Inteligente de CFOP</h1>
             
-            <div class="chat-container" id="chatContainer">
-                <div class="message ai-message">
-                    <strong>🤖 Assistente CFOP:</strong><br><br>
-                    Olá! Estou pronto para analisar as Notas Fiscais e validar os códigos CFOP. 
-                    Você pode me fazer perguntas como:<br>
-                    • Validar CFOP de todas as notas<br>
-                    • Analisar nota específica<br>
-                    • Gerar relatório de divergências<br>
-                    • Explicar o CFOP inferido
+            <div id="statusBadge"></div>
+            
+            <div class="examples">
+                <h3>💡 Exemplos de perguntas:</h3>
+                <div class="example-btn" onclick="usarExemplo('Quantas notas fiscais foram carregadas?')">
+                    Quantas notas?
+                </div>
+                <div class="example-btn" onclick="usarExemplo('Mostre o quinto registro do cabeçalho de notas')">
+                    Ver 5º registro
+                </div>
+                <div class="example-btn" onclick="usarExemplo('Liste as primeiras 3 notas do cabeçalho')">
+                    Primeiras 3 notas
+                </div>
+                <div class="example-btn" onclick="usarExemplo('Valide todas as notas e me dê um resumo')">
+                    Validar tudo
+                </div>
+                <div class="example-btn" onclick="usarExemplo('Explique o CFOP 5102')">
+                    Explicar CFOP
                 </div>
             </div>
             
-            <div class="loading" id="loading">
-                <div class="spinner"></div>
-                <p style="margin-top: 10px; color: #667eea;">Processando...</p>
+            <div class="chat-container" id="chatContainer">
+                <div class="loading">Carregando status do sistema...</div>
             </div>
             
             <div class="input-area">
-                <input type="text" id="promptInput" placeholder="Digite sua pergunta ou comando..." />
-                <button class="send-btn" id="sendBtn">Enviar</button>
-            </div>
-            
-            <div class="examples">
-                <h3>💡 Exemplos de comandos:</h3>
-                <div class="example-item" onclick="setPrompt(this.textContent)">
-                    Validar CFOP de todas as notas fiscais
-                </div>
-                <div class="example-item" onclick="setPrompt(this.textContent)">
-                    Mostrar apenas as notas com CFOP incorreto
-                </div>
-                <div class="example-item" onclick="setPrompt(this.textContent)">
-                    Analisar a nota fiscal número 3510129
-                </div>
-                <div class="example-item" onclick="setPrompt(this.textContent)">
-                    Gerar relatório completo de validação
-                </div>
-                <div class="example-item" onclick="setPrompt(this.textContent)">
-                    Quantas notas têm divergência de CFOP?
-                </div>
+                <input 
+                    type="text" 
+                    id="perguntaInput" 
+                    placeholder="Digite sua pergunta sobre as notas fiscais..."
+                    onkeypress="if(event.key==='Enter') enviarPergunta()"
+                >
+                <button onclick="enviarPergunta()" id="enviarBtn">Enviar</button>
             </div>
         </div>
-        
+
         <script>
-            const chatContainer = document.getElementById('chatContainer');
-            const promptInput = document.getElementById('promptInput');
-            const sendBtn = document.getElementById('sendBtn');
-            const loading = document.getElementById('loading');
-            
-            function setPrompt(text) {
-                promptInput.value = text.trim();
-                promptInput.focus();
-            }
-            
-            function addMessage(text, isUser) {
-                const messageDiv = document.createElement('div');
-                messageDiv.className = `message ${isUser ? 'user-message' : 'ai-message'}`;
-                messageDiv.innerHTML = isUser ? text : `<strong>🤖 Assistente:</strong><br><br>${text}`;
-                chatContainer.appendChild(messageDiv);
-                chatContainer.scrollTop = chatContainer.scrollHeight;
-            }
-            
-            async function sendMessage() {
-                const prompt = promptInput.value.trim();
-                if (!prompt) return;
+            let agenteInicializado = false;
+
+            verificarStatus();
+
+            async function verificarStatus() {{
+                try {{
+                    const response = await fetch('/status');
+                    const data = await response.json();
+                    
+                    agenteInicializado = data.agente_inicializado;
+                    
+                    const badge = document.getElementById('statusBadge');
+                    if (agenteInicializado) {{
+                        badge.innerHTML = '<span class="status-badge status-online">✅ Agente pronto</span>';
+                        document.getElementById('chatContainer').innerHTML = 
+                            '<div class="agent-message message">👋 Olá! Estou pronto para analisar suas notas fiscais. Faça uma pergunta!</div>';
+                    }} else {{
+                        badge.innerHTML = '<span class="status-badge status-offline">❌ Agente não inicializado</span>';
+                        document.getElementById('chatContainer').innerHTML = 
+                            '<div class="agent-message message">⚠️ Agente não inicializado. Por favor, faça upload dos arquivos CSV primeiro.<br><a href="/upload">→ Ir para Upload</a></div>';
+                        document.getElementById('enviarBtn').disabled = true;
+                        document.getElementById('perguntaInput').disabled = true;
+                    }}
+                }} catch (error) {{
+                    console.error('Erro ao verificar status:', error);
+                }}
+            }}
+
+            function usarExemplo(texto) {{
+                document.getElementById('perguntaInput').value = texto;
+                enviarPergunta();
+            }}
+
+            async function enviarPergunta() {{
+                const input = document.getElementById('perguntaInput');
+                const pergunta = input.value.trim();
                 
-                addMessage(prompt, true);
-                promptInput.value = '';
-                sendBtn.disabled = true;
-                loading.classList.add('show');
+                if (!pergunta) {{
+                    alert('Por favor, digite uma pergunta!');
+                    return;
+                }}
+
+                if (!agenteInicializado) {{
+                    alert('Agente não inicializado. Faça upload dos arquivos primeiro!');
+                    return;
+                }}
+
+                adicionarMensagem(pergunta, 'user');
+                input.value = '';
                 
-                try {
-                    const response = await fetch('/analisar/', {
+                const loadingDiv = document.createElement('div');
+                loadingDiv.className = 'loading';
+                loadingDiv.innerHTML = '🤔 Analisando...';
+                loadingDiv.id = 'loading';
+                document.getElementById('chatContainer').appendChild(loadingDiv);
+                scrollToBottom();
+
+                try {{
+                    const response = await fetch('/analisar/', {{
                         method: 'POST',
-                        headers: {
+                        headers: {{
                             'Content-Type': 'application/json'
-                        },
-                        body: JSON.stringify({ pergunta: prompt })
-                    });
-                    
-                    const result = await response.json();
-                    
-                    if (response.ok) {
-                        addMessage(result.resposta.replace(/\n/g, '<br>'), false);
-                    } else {
-                        throw new Error(result.detail || 'Erro na análise');
-                    }
-                } catch (error) {
-                    addMessage(`❌ Erro: ${error.message}`, false);
-                } finally {
-                    loading.classList.remove('show');
-                    sendBtn.disabled = false;
-                    promptInput.focus();
-                }
-            }
-            
-            sendBtn.addEventListener('click', sendMessage);
-            promptInput.addEventListener('keypress', (e) => {
-                if (e.key === 'Enter') sendMessage();
-            });
+                        }},
+                        body: JSON.stringify({{ pergunta: pergunta }})
+                    }});
+
+                    document.getElementById('loading')?.remove();
+
+                    if (response.ok) {{
+                        const data = await response.json();
+                        adicionarMensagem(data.resposta, 'agent');
+                    }} else {{
+                        const error = await response.json();
+                        adicionarMensagem(`❌ Erro: ${{error.detail}}`, 'agent');
+                    }}
+                }} catch (error) {{
+                    document.getElementById('loading')?.remove();
+                    adicionarMensagem(`❌ Erro de conexão: ${{error.message}}`, 'agent');
+                }}
+            }}
+
+            function adicionarMensagem(texto, tipo) {{
+                const chatContainer = document.getElementById('chatContainer');
+                const messageDiv = document.createElement('div');
+                messageDiv.className = `message ${{tipo}}-message`;
+                messageDiv.textContent = texto;
+                chatContainer.appendChild(messageDiv);
+                scrollToBottom();
+            }}
+
+            function scrollToBottom() {{
+                const container = document.getElementById('chatContainer');
+                container.scrollTop = container.scrollHeight;
+            }}
         </script>
     </body>
     </html>
-    """
-    return HTMLResponse(content=html_content)
+    """)
 
-@app.post("/processar_upload/")
-async def processar_upload(zip_file: UploadFile = File(...)):
-    """Processa o upload do arquivo ZIP com os CSVs"""
-    global agente
-    
-    try:
-        # Limpar diretórios temporários
-        limpar_diretorio_temp(TEMP_DIR)
-        
-        # Salvar arquivo ZIP
-        zip_path = UPLOAD_DIR / zip_file.filename
-        with open(zip_path, "wb") as buffer:
-            shutil.copyfileobj(zip_file.file, buffer)
-        
-        # Extrair arquivos
-        arquivos_extraidos = extrair_zip(zip_path, TEMP_DIR)
-        
-        # Verificar arquivos necessários
-        arquivos_necessarios = [
-            "202401_NFs_Cabecalho.csv",
-            "202401_NFs_Itens.csv",
-            "CFOP.csv"
-        ]
-        
-        arquivos_encontrados = [f.name for f in TEMP_DIR.glob("*.csv")]
-        faltando = [f for f in arquivos_necessarios if f not in arquivos_encontrados]
-        
-        if faltando:
-            raise HTTPException(
-                status_code=400,
-                detail=f"Arquivos faltando no ZIP: {', '.join(faltando)}"
-            )
-        
-        # Inicializar agente com os arquivos
-        agente = AgenteValidadorCFOP(
-            cabecalho_path=str(TEMP_DIR / "202401_NFs_Cabecalho.csv"),
-            itens_path=str(TEMP_DIR / "202401_NFs_Itens.csv"),
-            cfop_path=str(TEMP_DIR / "CFOP.csv")
-        )
-        
-        return JSONResponse(content={
-            "mensagem": "Arquivos processados com sucesso!",
-            "arquivos": arquivos_encontrados,
-            "status": "pronto_para_analise"
-        })
-        
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+# ============================================================================
+# ENDPOINT DE ANÁLISE
+# ============================================================================
 
 @app.post("/analisar/")
-async def analisar(pergunta: str = Form(...)):
-    """Endpoint para análise com agente IA"""
-    global agente
+async def analisar(request: PerguntaRequest):
+    """Processa perguntas através do agente IA"""
+    global agente_validador
     
-    if agente is None:
+    print(f"\n{'='*70}")
+    print(f"📥 REQUEST: POST /analisar/")
+    print(f"Detalhes: Pergunta: {request.pergunta}")
+    print(f"{'='*70}\n")
+    
+    print(f"📨 Pergunta recebida: {request.pergunta}")
+    print(f"🤖 Agente inicializado: {agente_validador is not None}")
+    
+    if agente_validador is None:
+        print("❌ Agente não inicializado!")
         raise HTTPException(
             status_code=400,
-            detail="Nenhum arquivo foi carregado. Faça upload dos arquivos primeiro."
+            detail="Agente não inicializado. Faça upload dos arquivos primeiro!"
         )
     
     try:
-        resposta = agente.processar_pergunta(pergunta)
-        return JSONResponse(content={"resposta": resposta})
+        print("🔄 Processando pergunta com o agente...")
+        resposta = agente_validador.processar_pergunta(request.pergunta)
+        print(f"✅ Resposta gerada ({len(resposta)} caracteres)")
+        print(f"Prévia: {resposta[:200]}...")
+        
+        return {"resposta": resposta}
+        
     except Exception as e:
+        print(f"❌ Erro ao processar: {e}")
+        traceback.print_exc()
         raise HTTPException(status_code=500, detail=str(e))
 
-@app.get("/status")
-async def status():
-    """Verifica o status da aplicação"""
-    return {
-        "status": "online",
-        "agente_inicializado": agente is not None,
-        "mensagem": "API de Validação CFOP funcionando!"
-    }
-
-if __name__ == "__main__":
-    import uvicorn
-    uvicorn.run(app, host="0.0.0.0", port=8000)
+# ============================================================================
+# FIM DO ARQUIVO
+# ============================================================================
